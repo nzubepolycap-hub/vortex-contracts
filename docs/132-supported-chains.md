@@ -237,15 +237,75 @@ unaffected.
 
 ## 6. Adding a New Chain
 
-To add support for a new source chain:
+> **Note (issue #408):** Use the atomic `propose_chain_onboarding` /
+> `execute_chain_onboarding` flow described in §6.1 below instead of the
+> individual manual steps.  The manual steps are retained here only as a
+> reference for operators who need to understand what the onboarding flow does
+> internally.
+
+### 6.1 Atomic onboarding (recommended — issue #408)
+
+The atomic flow bundles all required cross-contract changes into one timelocked
+proposal so a chain can never be left half-enabled.
+
+```bash
+# 1. Propose the onboarding bundle (starts the 48-hour timelock)
+stellar contract invoke --id <SETTLEMENT_CONTRACT_ID> --source <ADMIN_SECRET> --network testnet -- \
+  propose_chain_onboarding \
+  --config '{
+    "name": "scroll",
+    "wormhole_id": 34,
+    "axelar_name": "scroll",
+    "emitter": "<32-byte-hex-emitter-address>",
+    "axelar_source": "<axelar-gateway-contract-address>",
+    "token_format": "0x-prefixed 40-char hex"
+  }'
+
+# 2. Wait 48 hours, then execute (applies everything atomically)
+stellar contract invoke --id <SETTLEMENT_CONTRACT_ID> --source <ADMIN_SECRET> --network testnet -- \
+  execute_chain_onboarding --name '"scroll"'
+
+# 3. Optionally enable src_chain allowlist enforcement if not already on
+stellar contract invoke --id <SETTLEMENT_CONTRACT_ID> --source <ADMIN_SECRET> --network testnet -- \
+  set_src_chain_allowlist_enabled --enabled true
+```
+
+`execute_chain_onboarding` atomically:
+1. Adds `name` to the src-chain allowlist in `intent_settlement`.
+2. Calls `proof_registry.configure_chain(wormhole_id, emitter)` in the same
+   transaction, so proof verification is authorized immediately.
+3. Writes a live `ChainConfig` entry retrievable via `get_chain_config`.
+
+**Prerequisite:** The proof registry must have `intent_settlement` set as its
+configurator via `proof_registry.set_configurator(<settlement_address>)` before
+`execute_chain_onboarding` is called.
+
+### 6.2 Offboarding (removing a chain)
+
+```bash
+stellar contract invoke --id <SETTLEMENT_CONTRACT_ID> --source <ADMIN_SECRET> --network testnet -- \
+  execute_chain_offboarding --name '"scroll"'
+```
+
+This is **immediate** (no timelock) and removes the chain from both contracts.
+**In-flight intents** that were already submitted on the offboarded chain are
+unaffected — `src_chain` is validated only at `submit_intent` time, not at fill
+time.  Proofs already received and stored in `proof_registry` remain readable.
+Operators should wait for all open intents on the chain to resolve or expire
+before removing it.
+
+### 6.3 Manual onboarding steps (reference only)
+
+To add support for a new source chain manually (without the atomic flow):
 
 1. Choose a lowercase `src_chain` string (e.g. `"scroll"`).
 2. Identify its Wormhole chain ID (see [Wormhole chain IDs](https://docs.wormhole.com/wormhole/reference/constants)).
 3. Add the mapping to the chain-ID lookup table in `fill_intent`'s proof
    validation block (see [#129](./129-proof-mismatch-fallback.md) §4).
-4. Call `add_allowed_src_chain()` on the deployed contract.
-5. Update this document with the new row in §2 and token addresses in §4.
-6. Deploy and verify the source-chain `VortexDeposit` contract (see
+4. Call `add_allowed_src_chain()` on the deployed settlement contract.
+5. Call `proof_registry.set_authorized_emitter(chain_id, emitter)`.
+6. Update this document with the new row in §2 and token addresses in §4.
+7. Deploy and verify the source-chain `VortexDeposit` contract (see
    [#124](./124-proof-verification-interface.md) §5).
 
 ---

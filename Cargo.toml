@@ -5,6 +5,10 @@ members = [
   "solver_registry",
   "proof_registry",
   "reputation_badge",
+  "directory",
+  "treasury_streams",
+  "fee_router",
+  "arbiter_panel",
 ]
 resolver = "2"
 

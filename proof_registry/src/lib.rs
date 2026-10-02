@@ -179,6 +179,14 @@ pub enum Error {
     /// The application payload's self-declared `src_chain_id` does not match
     /// the `emitter_chain` the Guardians signed over.
     EmitterChainMismatch = 9,
+    /// Issue #408 — a chain ID that would overflow u16 was supplied.
+    ChainIdOutOfRange = 10,
+    /// Issue #408 — `configure_chain` or `remove_chain` called before
+    /// `set_configurator` has been set.
+    ConfiguratorNotSet = 11,
+    /// Issue #408 — `get_fresh_proof` found a proof that has exceeded
+    /// `PROOF_VALIDITY_WINDOW` since it was received.
+    ProofStale = 12,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -585,6 +593,19 @@ impl ProofRegistry {
             .get(&ProofKey::Admin)
             .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
         admin.require_auth();
+    }
+
+    /// Require that the caller is the registered configurator (typically
+    /// `intent_settlement`). Panics with `ConfiguratorNotSet` when no
+    /// configurator has been registered yet, or with `Unauthorized` when the
+    /// caller does not match the stored address.
+    fn require_configurator(env: &Env) {
+        let configurator: Address = env
+            .storage()
+            .instance()
+            .get(&ProofKey::Configurator)
+            .unwrap_or_else(|| panic_with_error!(env, Error::ConfiguratorNotSet));
+        configurator.require_auth();
     }
 
     /// Read one byte of `bytes`, failing closed with `InvalidPayload` if the

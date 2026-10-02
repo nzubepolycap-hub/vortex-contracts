@@ -95,6 +95,30 @@ local-network-status:  ## Check local network status
 
 # ── Help ──────────────────────────────────────────────────────────────────────
 
+# ── Kani model checking (issue #415) ────────────────────────────────────────
+
+.PHONY: kani
+kani:  ## Run Kani proof harnesses for pure arithmetic helpers (requires kani-verifier)
+	@command -v cargo-kani >/dev/null 2>&1 || { \
+		echo "Kani not found. Install with: cargo install --locked kani-verifier && cargo kani setup"; \
+		exit 1; \
+	}
+	cd $(WORKSPACE) && cargo kani \
+		--harness kani_slash_never_negative \
+		--harness kani_slash_never_exceeds_bond \
+		--harness kani_slash_floor_one \
+		--harness kani_tier_fill_window_monotone \
+		--harness kani_tier_fill_window_no_overflow \
+		--harness kani_fee_never_exceeds_amount \
+		--harness kani_fee_rounding_direction \
+		--harness kani_dutch_decay_bounds \
+		--harness kani_discount_in_range \
+		--harness kani_decode_payload_roundtrip \
+		--harness kani_slash_bps_monotone \
+		--harness kani_decode_i128_be_bounds_safe
+
+# ── Help ──────────────────────────────────────────────────────────────────────
+
 .PHONY: help
 help:  ## Show this help message
 	@echo "Usage: make <target>"

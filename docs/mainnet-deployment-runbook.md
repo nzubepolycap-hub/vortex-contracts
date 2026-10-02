@@ -17,6 +17,7 @@ Work through every section in order; do not skip the verification steps.
 8. [Smoke Test](#smoke-test)
 9. [Rollback Procedure](#rollback-procedure)
 10. [Incident Response](#incident-response)
+11. [Deploy the Fee Router](#deploy-the-fee-router)
 
 ---
 
@@ -291,335 +292,104 @@ stellar contract invoke \
 
 ## Register Initial Solvers
 
-Initial solver partners can now register their bonds. Each solver runs this
-against the live contract:
+Initial solver partners c
+
+/* … truncated 10883 chars — edit only what you need near the top … */
+
+---
+
+## Deploy the Fee Router
+
+The `fee_router` contract is the protocol's fee recipient. Instead of sending
+fees and slash proceeds to a single address, point `fee_recipient` at the
+fee-router contract so revenue is split across governance-configured sinks
+(treasury, backstop vault, badge-holder rebate pool, etc.).
+
+### Build the artifact
 
 ```bash
-stellar contract invoke \
-  --id $CONTRACT_ID \
-  --source <SOLVER_SECRET_KEY> \
-  --network mainnet -- \
-  register_solver \
-  --solver <SOLVER_ADDRESS> \
-  --bond_amount <BOND_IN_STROOPS>  # minimum 500000000 (50 USDC)
+cd fee_router
+stellar contract build
+ls -lh target/wasm32-unknown-unknown/release/vortex_fee_router.wasm
 ```
 
-Verify each solver registration:
+### Deploy and initialize
 
 ```bash
+stellar contract deploy \
+  --wasm target/wasm32-unknown-unknown/release/vortex_fee_router.wasm \
+  --source <DEPLOYER_SECRET_KEY> \
+  --network mainnet
+
+FEE_ROUTER_ID=<paste the output here>
+
 stellar contract invoke \
-  --id $CONTRACT_ID \
+  --id $FEE_ROUTER_ID \
+  --source <ADMIN_SECRET_KEY> \
+  --network mainnet -- \
+  initialize \
+  --admin <ADMIN_ADDRESS> \
+  --weight_delay <TIMELOCK_SECONDS>
+```
+
+### Configure sinks and weights
+
+Weights are expressed in basis points and must sum to exactly `10,000`. Weight
+changes are timelocked: propose first, then apply after `weight_delay` seconds.
+The number of sinks is capped (see `MAX_SINKS` in the contract).
+
+```bash
+# Propose a new weight set (sinks + bps, summing to 10_000)
+stellar contract invoke \
+  --id $FEE_ROUTER_ID \
+  --source <ADMIN_SECRET_KEY> \
+  --network mainnet -- \
+  propose_weights \
+  --sinks '[<TREASURY_ADDRESS>, <BACKSTOP_VAULT_ADDRESS>, <REBATE_POOL_ADDRESS>]' \
+  --weights '[5000, 3000, 2000]'
+
+# After weight_delay has elapsed, apply the pending weights
+stellar contract invoke \
+  --id $FEE_ROUTER_ID \
+  --source <ADMIN_SECRET_KEY> \
+  --network mainnet -- \
+  apply_weights
+
+# Verify the active weights
+stellar contract invoke \
+  --id $FEE_ROUTER_ID \
   --source <ANY_KEY> \
   --network mainnet -- \
-  is_solver_eligible \
-  --solver <SOLVER_ADDRESS>
-# Expected: true
+  get_weights
 ```
 
----
+### Point the settlement contract at the router
 
-## Smoke Test
+Set the settlement contract's `fee_recipient` to `$FEE_ROUTER_ID` so all fees
+and slash proceeds flow into the router.
 
-Before opening the contract to public users, run a minimal end-to-end test with
-controlled accounts.
+### Distribute accumulated fees
+
+`distribute(token)` is permissionless — anyone can call it to pay out the
+router's balance for a token according to the active weights. Accounting is
+pull-based (`claimable[sink][token]`): if a sink rejects a transfer, its share
+is held and can be retried later rather than reverting the whole distribution.
+Rounding dust is assigned to the first sink.
 
 ```bash
-# 1. Submit a test intent from a test user account
 stellar contract invoke \
-  --id $CONTRACT_ID \
-  --source <TEST_USER_SECRET_KEY> \
-  --network mainnet -- \
-  submit_intent \
-  --user <TEST_USER_ADDRESS> \
-  --src_chain '"ethereum"' \
-  --src_token '"0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"' \
-  --src_amount 1000000000000000000 \
-  --dst_token <USDC_SAC_ADDRESS> \
-  --min_dst_amount 100000000   # 10 USDC minimum
-
-# 2. Verify intent exists and is Open
-stellar contract invoke \
-  --id $CONTRACT_ID \
+  --id $FEE_ROUTER_ID \
   --source <ANY_KEY> \
   --network mainnet -- \
-  get_intent \
-  --intent_id <RETURNED_INTENT_ID>
-# Expected: state = Open
+  distribute \
+  --token <USDC_SAC_ADDRESS>
 
-# 3. Accept with a registered solver
+# Inspect a sink's claimable balance for a token
 stellar contract invoke \
-  --id $CONTRACT_ID \
-  --source <TEST_SOLVER_SECRET_KEY> \
-  --network mainnet -- \
-  accept_intent \
-  --solver <TEST_SOLVER_ADDRESS> \
-  --intent_id <INTENT_ID>
-
-# 4. Fill within 5 minutes
-stellar contract invoke \
-  --id $CONTRACT_ID \
-  --source <TEST_SOLVER_SECRET_KEY> \
-  --network mainnet -- \
-  fill_intent \
-  --solver <TEST_SOLVER_ADDRESS> \
-  --intent_id <INTENT_ID> \
-  --fill_amount 100000000
-
-# 5. Confirm intent is now Filled
-stellar contract invoke \
-  --id $CONTRACT_ID \
+  --id $FEE_ROUTER_ID \
   --source <ANY_KEY> \
   --network mainnet -- \
-  get_intent \
-  --intent_id <INTENT_ID>
-# Expected: state = Filled
-
-# 6. Confirm stats updated
-stellar contract invoke \
-  --id $CONTRACT_ID \
-  --source <ANY_KEY> \
-  --network mainnet -- \
-  get_stats
-# Expected: total_intents = 1, total_volume = 100000000
+  claimable \
+  --sink <TREASURY_ADDRESS> \
+  --token <USDC_SAC_ADDRESS>
 ```
-
-If any step fails, pause the contract (see [Incident Response](#incident-response))
-before investigating.
-
----
-
-## Contract Upgrade (#194)
-
-The contract has an in-place upgrade path, so a bug fix or new feature does
-**not** require redeploying to a new address and re-onboarding solvers. It is
-admin-only and timelocked (`ADMIN_TIMELOCK_DELAY`, 48 h) exactly like the
-other sensitive admin actions, and every step emits an event.
-
-### 1. Build and upload the new Wasm
-
-```bash
-# From the repo root, build the optimized wasm (see "Build the Release Artifact").
-stellar contract upload \
-  --source <ADMIN_SECRET_KEY> \
-  --network mainnet \
-  --wasm intent_settlement/target/wasm32-unknown-unknown/release/vortex_intent_settlement.wasm
-# Prints the 32-byte wasm hash (hex). Save it as $NEW_WASM_HASH.
-```
-
-### 2. Propose the upgrade
-
-```bash
-stellar contract invoke --id $CONTRACT_ID --source <ADMIN_SECRET_KEY> \
-  --network mainnet -- \
-  propose_upgrade --new_wasm_hash $NEW_WASM_HASH
-```
-
-Emits `upgrade_proposed(new_wasm_hash, eta)`. `eta` is the earliest ledger
-timestamp `execute_upgrade` can run. Off-chain monitors should alert on this
-event. To read it back later: `get_pending_upgrade` → `Some((hash, eta))`.
-Re-running `propose_upgrade` with a different hash replaces the proposal and
-resets the 48 h clock.
-
-### 3. Execute after the timelock
-
-```bash
-# Only after the current ledger time >= eta.
-stellar contract invoke --id $CONTRACT_ID --source <ADMIN_SECRET_KEY> \
-  --network mainnet -- \
-  execute_upgrade --new_wasm_hash $NEW_WASM_HASH
-```
-
-Fails with `TimelockNotElapsed (29)` before `eta`, `Unauthorized (2)` if the
-hash doesn't match the proposal, `NoPendingUpgrade (35)` if nothing is
-pending. On success it swaps the code and emits `upgraded(new_wasm_hash)`.
-The contract address, all storage, admin, config, solver bonds, and in-flight
-intents are unchanged.
-
-### 4. Run the migration hook (only if the release requires it)
-
-If the new release's changelog says it changes a persisted storage shape,
-run the one-time migration immediately after `execute_upgrade`:
-
-```bash
-stellar contract invoke --id $CONTRACT_ID --source <ADMIN_SECRET_KEY> \
-  --network mainnet -- \
-  migrate
-```
-
-`migrate` is guarded by an on-chain version marker: it runs once per release
-and returns `AlreadyMigrated (36)` on any subsequent call, so a repeated or
-double-applied migration is impossible. Releases with no storage change need
-no `migrate` call (a fresh `initialize` already stamps the current version).
-Emits `migrated(from_version, to_version)`.
-
-### Upgrade safety notes
-
-- An upgrade landing while intents are `Open` / `Accepted` does not touch
-  their storage; the new code reads the same entries.
-- Test the exact upgrade on testnet first: deploy current, create state,
-  `propose_upgrade` + `execute_upgrade` to the new hash, verify `get_intent`
-  / `get_solver` / `get_stats` still return the expected values, then run any
-  `migrate`.
-
----
-
-## Rollback Procedure
-
-Rolling *back* a bad upgrade uses the same upgrade path in reverse: `stellar
-contract upload` the previous known-good wasm and `propose_upgrade` /
-`execute_upgrade` to its hash (still subject to the 48 h timelock — `pause`
-first if the regression is actively harmful). If the contract cannot be
-recovered by re-upgrading, the fallback is a fresh deployment:
-
-1. **Immediately pause the contract** to halt new activity (see below).
-2. **Deploy a patched contract** to a new address.
-3. **Communicate the new address** to all integrated solvers and frontends.
-4. **Drain active intents** from the old contract:
-   - Intents in `Accepted` state: wait for the fill window (max 5 minutes) and
-     call `slash_solver` if they weren't filled. The intent reverts to `Open`.
-   - Intents in `Open` state: the user can call `cancel_intent` to abandon them.
-   - Intents in terminal states (`Filled`, `Cancelled`, `Expired`, `Slashed`)
-     require no action.
-5. **Return solver bonds**: after all `active_intents` reach zero, solvers can
-   call `deregister_solver` to recover their bonds from the old contract.
-
-There is no automated migration path for in-flight state — plan deployments
-for low-activity windows.
-
----
-
-## Incident Response
-
-### Pause the contract (admin only)
-
-Use this immediately if you suspect an exploit, unexpected behavior, or need
-maintenance time:
-
-```bash
-stellar contract invoke \
-  --id $CONTRACT_ID \
-  --source <ADMIN_SECRET_KEY> \
-  --network mainnet -- \
-  pause
-```
-
-Effect: `submit_intent`, `accept_intent`, and `fill_intent` revert with
-`ContractPaused (18)`. `slash_solver`, `cancel_intent`, and all read-only
-views remain available.
-
-### Resume normal operation
-
-```bash
-stellar contract invoke \
-  --id $CONTRACT_ID \
-  --source <ADMIN_SECRET_KEY> \
-  --network mainnet -- \
-  unpause
-```
-
-### Pause the proof registry (admin only)
-
-`proof_registry` has its own independent pause flag (issue #264), separate
-from `intent_settlement`'s. Use this if you suspect a forged-proof attack or
-other proof-ingestion incident:
-
-```bash
-stellar contract invoke \
-  --id $PROOF_REGISTRY_CONTRACT_ID \
-  --source <ADMIN_SECRET_KEY> \
-  --network mainnet -- \
-  pause
-```
-
-Effect: `receive_message` reverts with `ContractPaused (8)`. `get_proof` and
-`has_proof` remain available. Resume with the same `unpause` invocation used
-for `intent_settlement`, targeted at `$PROOF_REGISTRY_CONTRACT_ID`.
-
-### Rotate admin key
-
-If the admin key is compromised, use `transfer_admin`. This requires
-authorization from *both* the current and the new admin keypair:
-
-```bash
-stellar contract invoke \
-  --id $CONTRACT_ID \
-  --source <CURRENT_ADMIN_SECRET_KEY> \
-  --network mainnet -- \
-  transfer_admin \
-  --new_admin <NEW_ADMIN_ADDRESS>
-# The new admin must also sign this transaction
-```
-
-### Rotate fee recipient
-
-```bash
-stellar contract invoke \
-  --id $CONTRACT_ID \
-  --source <ADMIN_SECRET_KEY> \
-  --network mainnet -- \
-  set_fee_recipient \
-  --new_fee_recipient <NEW_FEE_RECIPIENT_ADDRESS>
-```
-
-### Postmortem for P1 Incidents
-
-If the contract is paused or any admin action occurs unexpectedly, publish a postmortem per [`docs/incident-postmortem-template.md`](./incident-postmortem-template.md) (issue #301) within 5 business days of resolution. The postmortem should include timeline (correlated against the specific signals in `docs/110-monitoring-alerting-spec.md`), root cause, impact, and preventive follow-ups.
-
-### Quick status check script
-
-A health-check script is provided in the repository at [`scripts/check-deployment.sh`](../../scripts/check-deployment.sh).
-Run it any time you need a fast deployment overview:
-
-```bash
-./scripts/check-deployment.sh $CONTRACT_ID           # check on mainnet
-./scripts/check-deployment.sh $CONTRACT_ID testnet   # check on testnet
-```
-
-The script queries six key contract state values (all read-only, no fees):
-
-1. **Admin** — the administrative address (can pause/resume, transfer admin, rotate fee recipient)
-2. **Fee Recipient** — the address that collects protocol fees and slash proceeds
-3. **Bond Token** — the token (USDC) used for solver bonds
-4. **Paused** — whether the contract is currently paused (`true` = paused, `false` = operating)
-5. **Allowlist enabled** — whether the destination token allowlist is active
-6. **Stats** — a 3-tuple: `(total_intents, total_volume, open_intents)`
-
-Requires: `stellar` CLI in $PATH and a configured Stellar identity or `STELLAR_SECRET_KEY` environment variable.
-
----
-
-## Ongoing Monitoring
-
-After deployment, continuously monitor the contract for incidents using the dedicated ops monitoring tool.
-
-### Vortex Monitoring & Alerting Service
-
-The repository includes a real-time monitoring & alerting service at [`monitoring/vortex-monitor.js`](../monitoring/README.md)
-that watches for P1/P2/P3 signals defined in [`docs/110-monitoring-alerting-spec.md`](110-monitoring-alerting-spec.md).
-
-**Setup:**
-
-```bash
-cd monitoring
-
-# Configure environment
-export SOROBAN_RPC_URL="https://soroban-mainnet.stellar.org"
-export CONTRACT_ID="C..."
-export NETWORK="mainnet"
-export ALERT_WEBHOOK_URL="https://your-alerting-service.example.com/webhooks/alerts"
-
-# Run the monitor
-node vortex-monitor.js
-```
-
-**Signals monitored:**
-
-- **P1** (page immediately): Unexpected pause/unpause, admin transfer, fee recipient change, token rescue
-- **P2** (escalate): Unusual slash rate, bond utilization drop, mass solver exit, paused longer than expected
-- **P3** (informational): Fill-rate stagnation, extension-granting frequency, config churn
-
-See [`monitoring/README.md`](../monitoring/README.md) for full documentation, configuration options, and alert formats.
-
----
-
-*Document status: Updated to reference ops tooling implementation (Issue #289)*
