@@ -4,6 +4,11 @@ Tracking issue: [#48](https://github.com/stellar-vortex-protocol/vortex-contract
 
 **Arbiter Selection Process:** See [`docs/arbiter-election-process.md`](./arbiter-election-process.md) (issue #309) for how the community nominates and endorses arbiter candidates. This document describes dispute resolution mechanics; arbiter-election describes who serves on the committee.
 
+**Arbiter Panel (issue #407):** The single-arbiter role described below is
+replaced by an m-of-n bonded arbiter panel. See
+[Arbiter panel](#arbiter-panel-m-of-n-bonded-arbiters) for the panel contract,
+selection, voting, and tally rules.
+
 ---
 
 ## Problem statement
@@ -41,10 +46,9 @@ following is true:
 
 **v1 dispute scope:** A dispute window is provided for a user to flag potential
 wrong-recipient or off-chain-integrity concerns. Resolution is performed by a
-designated arbiter role (initially admin, upgradeable to a multisig or separate
-arbitration contract). The on-chain mechanism escrows the fill amount during the
-dispute window rather than immediately releasing it, making the arbiter's
-decision enforceable.
+bonded m-of-n arbiter panel (see below). The on-chain mechanism escrows the
+fill amount during the dispute window rather than immediately releasing it,
+making the panel's decision enforceable.
 
 ---
 
@@ -61,7 +65,7 @@ Open → Accepted → Filling (new) → Filled
 |---|---|
 | `Filling` | Solver has called `begin_fill`; output tokens are held in escrow by the contract. The user has a dispute window to contest. |
 | `Disputed` | User raised a dispute during the window; fill is on hold. |
-| `Resolved` | Arbiter closed the dispute. Sub-outcome stored separately. |
+| `Resolved` | Arbiter panel closed the dispute. Sub-outcome stored separately. |
 
 ### New fields on `IntentRecord`
 
@@ -73,8 +77,8 @@ pub resolution: Option<DisputeResolution>, // Upheld | Dismissed
 
 ```rust
 pub enum DisputeResolution {
-    Upheld,    // arbiter sided with user; tokens returned to user, solver slashed
-    Dismissed, // arbiter sided with solver; tokens released from escrow to user normally
+    Upheld,    // panel sided with user; tokens returned to user, solver slashed
+    Dismissed, // panel sided with solver; tokens released from escrow to user normally
 }
 ```
 
@@ -92,23 +96,23 @@ contract escrow --[fill_amount]--> user
 contract --[fee]--> fee_recipient  (deducted from fill, same as current)
 ```
 
-### With a dispute: arbiter upholds the user
+### With a dispute: panel upholds the user
 
 ```
 solver --[fill_amount]--> contract escrow (begin_fill)
 user calls open_dispute(intent_id)
-arbiter calls resolve_dispute(intent_id, Upheld)
+panel calls resolve_dispute(intent_id, Upheld)
   contract escrow --[fill_amount]--> user   (user made whole)
   solver bond slashed 10 % (same as slash_solver)
   intent re-opened for a new solver  OR  intent set to Resolved/Expired
 ```
 
-### With a dispute: arbiter dismisses (solver wins)
+### With a dispute: panel dismisses (solver wins)
 
 ```
 solver --[fill_amount]--> contract escrow (begin_fill)
 user calls open_dispute(intent_id)
-arbiter calls resolve_dispute(intent_id, Dismissed)
+panel calls resolve_dispute(intent_id, Dismissed)
   contract escrow --[fill_amount]--> user   (user still receives tokens)
   no slash; intent state = Resolved(Dismissed)
   solver bond unlocked
@@ -130,8 +134,8 @@ pub fn begin_fill(env: Env, solver: Address, intent_id: BytesN<32>, fill_amount:
 /// Only callable while state == Filling and now < dispute_deadline.
 pub fn open_dispute(env: Env, user: Address, intent_id: BytesN<32>);
 
-/// Arbiter resolves a dispute. Triggers fund release and optional slash.
-/// Only callable by the designated arbiter address while state == Disputed.
+/// Arbiter panel resolves a dispute. Triggers fund release and optional slash.
+/// Only callable by the arbiter_panel contract while state == Disputed.
 pub fn resolve_dispute(env: Env, arbiter: Address, intent_id: BytesN<32>, resolution: DisputeResolution);
 
 /// Permissionless: release escrow to user after dispute window closes without a dispute.
@@ -140,20 +144,72 @@ pub fn release_fill(env: Env, intent_id: BytesN<32>);
 
 ---
 
+## Arbiter panel (m-of-n bonded arbiters)
+
+Issue #407 replaces the single arbiter with an `arbiter_panel` contract. The
+settlement contract no longer trusts one address: `resolve_dispute` accepts a
+resolution only from the registered panel contract.
+
+### Registration and bond
+
+- `register_arbiter(arbiter, bond)` — an arbiter stakes a bond (in the
+  settlement token) to join the panel. The bond is held by the panel contract.
+- `deregister_arbiter(arbiter)` — allowed only when the arbiter has no open
+  votes; returns the remaining bond.
+- Only bonded arbiters are eligible for selection.
+
+### Panel selection
+
+- Per dispute, the panel is drawn from the bonded set using `env.prng()` seeded
+  with `intent_id`.
+- **Documented limitation:** the ledger PRNG is manipulable by the ledger
+  closer, so panel selection is *random-ish*, not cryptographically fair. It is
+  therefore unsuitable as a sole defence; it is combined with bonds, public
+  votes, and the timeout fallback below.
+- **Exclusions:** an arbiter who is also the solver or the user for that intent
+  is excluded from the panel.
+- **Fewer than n available:** if fewer than `n` eligible arbiters exist, the
+  panel is filled with all eligible arbiters and the threshold `m` is scaled
+  down proportionally (never below 1). If no eligible arbiter exists, the
+  dispute falls through to the `ARBITER_WINDOW` timeout rule.
+
+### Voting window and public votes
+
+- `open_vote(intent_id)` selects the panel and opens a voting window
+  (`VOTE_WINDOW`, proposed 86400 s / 24 h).
+- `vote(arbiter, intent_id, resolution)` records a public on-chain vote. Each
+  selected arbiter may vote once; votes are emitted as events for full
+  auditability.
+
+### Tally and settlement
+
+- `tally(intent_id)` counts votes. When `m`-of-`n` votes agree, the panel calls
+  `resolve_dispute` on the settlement contract with the majority outcome.
+- **Bond slashing:** arbiters who voted against the final outcome, or who did
+  not vote at all, lose part of their bond. The slashed portion is split into
+  the dispute-bond split (out of scope: arbiter rewards beyond this split).
+- **Timeout fallback:** if the voting window elapses without reaching `m`
+  votes, the existing `ARBITER_WINDOW` rule applies — a permissionless timeout
+  releases escrow to the user (conservative default).
+
+---
+
 ## Arbiter role
 
-**v1:** The `admin` address acts as arbiter. This is the simplest safe option
-for testnet — it requires no new storage key or governance mechanism.
+**v1 (superseded by #407):** The `admin` address acted as arbiter. This was the
+simplest safe option for testnet — it required no new storage key or governance
+mechanism.
 
-**v2 (recommended before mainnet):** A separate `arbiter` storage key, settable
-by admin via `set_arbiter(env, new_arbiter: Address)`. The arbiter can be:
-- A protocol-controlled multisig (3-of-5)
-- A future `solver_registry` contract that runs a reputation-weighted jury
+**v2 (current):** The `arbiter_panel` contract holds the arbiter role. The
+settlement contract stores the panel contract address (settable by admin via
+`set_arbiter_panel(env, panel: Address)`) and accepts `resolve_dispute` only
+from it. The panel is an m-of-n bonded committee; see
+[Arbiter panel](#arbiter-panel-m-of-n-bonded-arbiters).
 
 **Arbiter governance:** See [`docs/arbiter-code-of-conduct.md`](./arbiter-code-of-conduct.md)
 (issue #300) for the complete governance policy, eligibility criteria, conflict-of-interest
 disclosure requirements, recusal procedures, and decision-rationale standards that arbiters
-must follow in both v1 (admin arbiter) and v2+ (committee arbiters).
+must follow.
 
 **Out of scope for this design:** fully trustless arbitration (requires a
 cross-chain proof oracle).
@@ -165,7 +221,8 @@ cross-chain proof oracle).
 | Parameter | Proposed value | Rationale |
 |---|---|---|
 | `DISPUTE_WINDOW` | 3600 s (1 hour) | Long enough for the user to notice and act; short enough not to hold solver capital indefinitely. Adjustable by governance. |
-| `ARBITER_WINDOW` | 86400 s (24 hours) | After a dispute is raised, the arbiter has 24 hours to resolve. If unresolved, a permissionless timeout releases escrow to the user (conservative default). |
+| `VOTE_WINDOW` | 86400 s (24 hours) | Window for the selected panel to cast votes before the tally. |
+| `ARBITER_WINDOW` | 86400 s (24 hours) | After a dispute is raised, the panel has 24 hours to resolve. If unresolved, a permissionless timeout releases escrow to the user (conservative default). |
 
 ---
 
@@ -174,8 +231,13 @@ cross-chain proof oracle).
 - **Griefing:** A user could open spurious disputes to delay solver capital
   release. Mitigation: require a small dispute bond from the user (e.g. 1 USDC),
   returned on Upheld, forfeited on Dismissed. Defer to follow-up issue.
-- **Arbiter capture:** A colluding arbiter could always dismiss. Mitigation: v2
-  multisig arbiter; on-chain event emission for full auditability.
+- **Arbiter capture:** A single colluding arbiter can no longer decide alone;
+  `m`-of-`n` votes are required and dissenting/non-voting arbiters lose bond.
+  Residual risk: a majority of the panel colluding — mitigated by bonds, public
+  votes, and the timeout fallback.
+- **PRNG manipulation:** panel selection uses `env.prng()` seeded with
+  `intent_id`; the ledger closer can influence it. Documented above as a known
+  limitation, not a sole defence.
 - **Escrow risk:** Tokens sit in the contract during the window. The contract
   must not be upgradeable without governance while escrowing user funds.
 - **Re-entrancy:** `begin_fill` uses `transfer_from(solver → contract)`;
@@ -188,20 +250,7 @@ cross-chain proof oracle).
 
 1. Add `Filling` / `Disputed` / `Resolved` states and new `IntentRecord` fields.
 2. Implement `begin_fill` + escrow logic (replaces direct transfer in `fill_intent`).
-3. Implement `open_dispute` with dispute window enforcement.
-4. Implement `resolve_dispute` with fund release and optional slash.
-5. Implement `release_fill` permissionless timeout.
-6. Add dispute bond (anti-griefing) — separate issue.
-7. Add `set_arbiter` + v2 multisig arbiter — separate issue.
-8. Full test suite for the new dispute lifecycle.
-
----
-
-*Design status: Implemented in `intent_settlement` (issue #188).*  
-*The escrow/dispute flow ships as `begin_fill` → `dispute_fill` /*
-*`resolve_dispute` / `release_fill`, with states `Filling` / `Disputed` /*
-*`Resolved` and enum `DisputeResolution { Upheld, Dismissed }`. Deviations from*
-*this sketch: the permissionless timeout and clean release are unified into a*
-*single `release_fill` entrypoint; the arbiter is stored at `DataKey::Arbiter`*
-*(defaulting to `Admin`) via `set_arbiter`, slightly ahead of the "v2" note.*  
-*Last updated: 2026-08-28*
+3. Implement `open_dispute` + `resolve_dispute` (panel-only caller).
+4. Implement the `arbiter_panel` contract: register/bond, PRNG panel selection,
+   voting window, m-of-n tally, bond slashing, and timeout fallback.
+5. Tests: full dispute lifecycle with the panel, including a collusion scenario.
