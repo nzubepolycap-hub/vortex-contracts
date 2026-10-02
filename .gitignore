@@ -49,6 +49,20 @@ deploy-testnet.env
 # proptest failure-seed artifacts
 proptest-regressions/
 
+# backstop_vault build artifacts
+backstop_vault/target/
+
+# Coverage artifacts
+lcov.info
+coverage/
+tarpaulin-report.html
+
+# Rust profiling artifacts
+*.profdata
+*.profraw
+
+# Cargo.lock files for individual crates (reproducible via workspace)
+backstop_vault/Cargo.lock
 # Cargo lock files for library crates (keep for binary/contract crates)
 # Uncomment to ignore: #Cargo.lock
 

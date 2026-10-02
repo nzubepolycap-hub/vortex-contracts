@@ -48,6 +48,7 @@ const DISPUTE_WINDOW: u64 = 3_600; // 1 hour
 /// Arbiter's time to resolve a dispute (issue #188).  After expiry, release_fill becomes permissionless.
 const ARBITER_WINDOW: u64 = 86_400; // 24 hours
 
+/// Anti-griefing bond a user must post when opening a dispute (#188).
 /// Minimum solver bond (50 USDC).
 const MIN_BOND: i128 = 50 * 10_000_000;
 
@@ -86,6 +87,7 @@ const DISPUTE_WINDOW: u64 = 3_600; // 1 hour
 
 /// After being slashed a solver must wait this many seconds before they can
 /// accept new intents. Used by `accept_intent`'s cooldown guard and by
+/// `get_slash_cooldown_remaining` (issue #256).
 /// `get_slash_cooldown_remaining` (issue #256), which both derive from the
 /// same `slash_cooldown_remaining` helper so they can never disagree.
 const SLASH_COOLDOWN: u64 = 3_600; // 1 hour
@@ -107,6 +109,76 @@ const CANCEL_COOLDOWN: u64 = 60; // 1 minute (NOT 1 hour; validated at #341)
 /// Separate from CANCEL_COOLDOWN to allow frequent amendments for liquidity.
 const AMENDMENT_COOLDOWN: u64 = 60; // 1 minute
 const SLASH_COOLDOWN: u64 = 3_600; // 1 hour
+
+/// Delay enforced between proposing and executing a sensitive admin change
+/// (admin transfer, fee recipient handover, dst_token allowlist changes).
+/// Gives users and solvers a window to notice and react before the change
+/// takes effect (#115).
+const ADMIN_TIMELOCK_DELAY: u64 = 172_800; // 48 hours
+
+// ─── Default protocol parameters (#202) ──────────────────────────────────────
+const DEFAULT_MIN_BOND: i128 = MIN_BOND; // 50 USDC
+const DEFAULT_FILL_WINDOW: u64 = FILL_WINDOW; // 300 s
+const DEFAULT_INTENT_EXPIRY: u64 = INTENT_EXPIRY; // 1800 s
+const DEFAULT_PROTOCOL_FEE_BPS: i128 = PROTOCOL_FEE_BPS; // 5 bps (0.05%)
+const DEFAULT_MAX_ACTIVE_INTENTS_PER_SOLVER: u32 = 10;
+
+// ─── `set_config` bounds (#202) ──────────────────────────────────────────────
+const MAX_PROTOCOL_FEE_BPS: i128 = 1_000; // 10% — hard ceiling on the protocol fee
+const MIN_FILL_WINDOW_SECS: u64 = 60; // a solver needs at least a minute to deliver a fill
+const MIN_INTENT_EXPIRY_SECS: u64 = 300; // an intent must stay live for at least five minutes
+const MIN_BOND_FLOOR: i128 = 10_000_000; // 1 USDC (7 decimals) — absolute floor for `min_bond`
+
+// ─── Cooldowns (#202) ────────────────────────────────────────────────────────
+
+/// Minimum gap the same user must leave between `cancel_intent` calls.
+const CANCEL_COOLDOWN: u64 = 60; // 1 minute
+
+// ─── Batch + extension limits (#202) ─────────────────────────────────────────
+
+/// Upper bound on the number of items any `batch_*` entrypoint processes in a single call.
+const MAX_BATCH_SIZE: u32 = 20;
+
+/// Longest additional time `request_extension` can add to an Accepted intent's deadline.
+const MAX_EXTENSION_DURATION: u64 = 300; // 5 minutes
+
+// ─── Competitive bid window (#191) ───────────────────────────────────────────
+const BID_WINDOW: u64 = 600; // 10 minutes
+
+// ─── Storage-migration schema version (#194) ─────────────────────────────────
+const MIGRATION_VERSION: u32 = 1;
+
+// ─── Basis-points denominator ────────────────────────────────────────────────
+const BPS_DENOMINATOR: i128 = 10_000;
+
+// ─── Amount sanity bounds ─────────────────────────────────────────────────────
+/// Upper bound for src_amount and min_dst_amount (10^30).
+pub const MAX_AMOUNT: i128 = 1_000_000_000_000_000_000_000_000_000_000i128;
+/// Ceiling on whole dst_token units for the decimals-aware guard (#252).
+const MAX_WHOLE_UNITS: i128 = 1_000_000_000_000i128; // 1 trillion
+
+// ─── TTL constants ────────────────────────────────────────────────────────────
+const DAY_IN_LEDGERS: u32 = 17280; // ~5s per ledger
+const PERSISTENT_TTL_THRESHOLD: u32 = DAY_IN_LEDGERS * 14;
+const PERSISTENT_TTL_EXTEND_TO: u32 = DAY_IN_LEDGERS * 30;
+const INSTANCE_TTL_THRESHOLD: u32 = DAY_IN_LEDGERS * 30;
+const INSTANCE_TTL_EXTEND_TO: u32 = DAY_IN_LEDGERS * 60;
+
+// ─── Referral (#281) ─────────────────────────────────────────────────────────
+const MAX_REFERRAL_SHARE_BPS: i128 = 5_000; // 50% max referral share
+
+// ─── Validation limits ───────────────────────────────────────────────────────
+const MAX_CHAIN_LEN: u32 = 64;
+const MAX_TOKEN_LEN: u32 = 128;
+const MAX_FILL_HISTORY: u32 = 10;
+
+// ─── Backstop compensation caps (#369) ───────────────────────────────────────
+/// Maximum compensation per intent: 10% of min_dst_amount.
+const MAX_BACKSTOP_INTENT_BPS: i128 = 1_000;
+/// Maximum compensation per user per 24-hour epoch.
+const MAX_BACKSTOP_USER_EPOCH_CLAIM: i128 = 5 * 50 * 10_000_000; // 5 × 50 USDC
+/// Epoch length for per-user backstop claim caps.
+const BACKSTOP_EPOCH_SECS: u64 = 86_400; // 24 hours
 
 /// Minimum gap between successive cancel_intent() calls by the same user (issue #341).
 /// Deters cancel-spam griefing while allowing correction of mistakes.
@@ -558,6 +630,77 @@ pub enum DataKey {
     /// exactly like `DstAllowlistEnabled`.
     ProofRegistry,
 
+    // ── Multi-bond-token support (#187) ─────────────────────────────────────
+    /// Per-(solver, bond_token) bond balance (i128).
+    SolverBond(Address, Address),
+    /// Allowed bond tokens set (presence flag `true`).
+    AllowedBondToken(Address),
+    /// Minimum bond amount required for a non-default bond token (i128).
+    MinBond(Address),
+
+    // ── Per-solver pending intents list (#230) ───────────────────────────────
+    /// `Vec<BytesN<32>>` of intent IDs currently accepted by this solver.
+    SolverIntents(Address),
+
+    // ── Total bonded across all solvers (#231) ───────────────────────────────
+    TotalBonded,
+
+    // ── Token-level stats (#248) ─────────────────────────────────────────────
+    TokenVolume(Address),
+    TokenFees(Address),
+
+    // ── Fee discount schedule (#192) ─────────────────────────────────────────
+    /// `Vec<(i128, i128)>` — (min_volume, discount_bps) pairs, ascending.
+    FeeDiscountTiers,
+
+    // ── Open-intent enumeration list (#249) ──────────────────────────────────
+    OpenIntentList,
+
+    // ── Solver registry link (#197) ───────────────────────────────────────────
+    SolverRegistry,
+
+    // ── Solver routes (#255) ─────────────────────────────────────────────────
+    SolverRoutes(Address),
+
+    // ── Reputation snapshot (#272) ───────────────────────────────────────────
+    SolverReputation(Address),
+
+    // ── Contract upgrade (#194) ──────────────────────────────────────────────
+    PendingUpgrade,
+    MigrationVersion,
+
+    // ── Bid window (#191) ────────────────────────────────────────────────────
+    BidWindowEnabled,
+    BestBid(BytesN<32>),
+
+    // ── Dispute / arbiter (#188) ─────────────────────────────────────────────
+    Arbiter,
+
+    // ── Backstop pool (#280) ─────────────────────────────────────────────────
+    /// Current backstop pool balance (i128), funded by slash proceeds.
+    BackstopPool,
+    /// Presence flag recording that a user already claimed for this intent.
+    BackstopClaimed(BytesN<32>),
+
+    // ── #367 Exposure tracking ────────────────────────────────────────────────
+    /// Per-solver accepted notional exposure (i128).
+    SolverExposure(Address),
+
+    // ── #368 Oracle ───────────────────────────────────────────────────────────
+    /// Address of the oracle adapter contract.
+    OracleAddr,
+    /// Pending oracle proposal: (Address, u64 eta).
+    PendingOracle,
+
+    // ── #369 Per-user epoch claims ────────────────────────────────────────────
+    /// Per-user epoch claim amount (i128). Key: (user, epoch_number).
+    UserEpochClaim(Address, u64),
+
+    // ── #370 Backstop vault ───────────────────────────────────────────────────
+    /// Address of the deployed backstop_vault contract.
+    BackstopVault,
+    /// bps of fees/slashes routed to the vault.
+    BackstopVaultShareBps,
     /// **Persistent storage.** Pending `propose_rescue` record for `token`:
     /// stores the target address, the amount, the ledger timestamp at which
     /// `execute_rescue` may apply it, and the ledger sequence at which the
@@ -767,6 +910,19 @@ pub struct ProtocolConfig {
     pub protocol_fee_bps: i128,
     /// Maximum number of intents a single solver may accept simultaneously (issue #230).
     pub max_active_intents_per_solver: u32,
+
+    /// Maximum slash cycles before an intent is abandoned (#241).
+    pub max_slash_cycles: u32,
+
+    /// Referral share in bps (0 = disabled, max 5000 = 50%) (#281).
+    pub referral_share_bps: i128,
+
+    /// Bps of fees/slashes routed to the backstop vault (#370, 0 = disabled).
+    pub backstop_vault_share_bps: i128,
+
+    /// Exposure coverage multiplier (#367): accepted_notional <= bond * coverage_multiplier.
+    /// Stored as a plain integer (e.g. 10 means 10×).
+    pub coverage_multiplier: i128,
     /// Issue #362: Optional deposit token (None = deposits disabled).
     pub submission_deposit_token: Option<Address>,
     /// Issue #362: Deposit amount in smallest units (refunded on fill/cancel, forfeited on expiry).
@@ -859,6 +1015,12 @@ pub struct IntentRecord {
     /// (`Open` / `PartiallyFilled`) or the registry integration is unset.
     pub solver_tier: u32,
 
+    /// #281: optional referrer address for fee-sharing.
+    pub referrer: Option<Address>,
+
+    /// #241: number of slash cycles this intent has been through.
+    /// Used by `slash_solver` to detect `max_slash_cycles` exhaustion and
+    /// by `claim_backstop_compensation` to confirm eligibility.
     /// Issue #371: ledger timestamp at which this intent entered a terminal
     /// state (Filled, Cancelled, Expired, Resolved, Slashed). `None` for
     /// intents that have not yet reached a terminal state. Used by
@@ -1276,6 +1438,90 @@ pub enum Error {
     /// submitting `user`.  Self-referral is rejected to prevent a user from
     /// gaming the referral programme by naming their own address.
     SelfReferral = 35,
+
+    // ── Previously missing variants ──────────────────────────────────────────
+    /// `set_config` received an invalid parameter value.
+    InvalidConfig = 36,
+    /// The timelock delay since the matching `propose_*` call has not elapsed.
+    TimelockNotElapsed = 37,
+    /// `accept_admin_transfer` called with no pending proposal.
+    NoPendingAdminTransfer = 38,
+    /// `execute_add_dst_token` / `execute_remove_dst_token` with no proposal.
+    NoPendingDstTokenChange = 39,
+    /// `cancel_intent` rate-limit cooldown not yet expired.
+    CancelCooldownNotExpired = 40,
+    /// `src_amount` or `min_dst_amount` exceeds the MAX_AMOUNT safety ceiling.
+    AmountTooLarge = 41,
+    /// `min_dst_amount` is implausible given the dst_token's declared decimals.
+    ImplausibleDstAmount = 42,
+    /// Solver's active-intent count is at the configured cap.
+    MaxActiveIntentsCapReached = 43,
+    /// Bond token is not on the allowed-token set.
+    BondTokenNotAllowed = 44,
+    /// `request_extension` already used for this intent.
+    ExtensionAlreadyGranted = 45,
+    /// Withdrawal would leave the solver under-covered.
+    ExtensionCapExceeded = 46,
+    /// `migrate` called on a contract already at the current schema version.
+    AlreadyMigrated = 47,
+    /// Bid-window closed — cannot accept new bids.
+    BidWindowClosed = 48,
+    /// `settle_bids` called while bid window is still open.
+    BidWindowStillOpen = 49,
+    /// Submitted bid does not improve on the current best.
+    BidNotHigher = 50,
+    /// Intent is not in Bidding state.
+    IntentNotBidding = 51,
+    /// Intent is not in Filling state.
+    IntentNotFilling = 52,
+    /// Intent is not in Disputed state.
+    IntentNotDisputed = 53,
+    /// Caller is not the arbiter.
+    NotArbiter = 54,
+    /// Arbiter resolution window has elapsed.
+    ArbiterWindowExpired = 55,
+    /// Dispute window is still open — cannot release fill yet.
+    DisputeWindowStillOpen = 56,
+    /// Dispute window has already expired — cannot raise a dispute.
+    DisputeWindowExpired = 57,
+    /// The dispute window has closed with no dispute.
+    DisputeWindowClosed = 58,
+    /// No fill is currently held in escrow for this intent.
+    NoFillEscrowed = 59,
+    /// No pending contract upgrade to execute.
+    NoPendingUpgrade = 60,
+    /// `fill_intent` called on a non-Accepted intent (different message path).
+    IntentNotAcceptedForFill = 61,
+    /// Solver has too many bond tokens.
+    TooManyBondTokens = 62,
+    /// Solver has too many route entries.
+    TooManyRouteEntries = 63,
+    /// `batch_*` called with more than MAX_BATCH_SIZE items.
+    BatchTooLarge = 64,
+    /// No dispute is currently open for this intent.
+    NoDisputeOpen = 65,
+
+    // ── #369 Backstop hardening ───────────────────────────────────────────────
+    /// Backstop pool is empty — nothing to pay out.
+    BackstopPoolEmpty = 66,
+    /// User already claimed backstop compensation for this intent.
+    BackstopAlreadyClaimed = 67,
+
+    // ── #367 Exposure tracking ────────────────────────────────────────────────
+    /// Accepting this intent would exceed the solver's coverage capacity.
+    ExposureExceeded = 68,
+
+    // ── #368 Oracle ───────────────────────────────────────────────────────────
+    /// Oracle price data is stale (too old).
+    OraclePriceStale = 69,
+    /// Oracle returned a zero or invalid price.
+    OraclePriceInvalid = 70,
+    /// No oracle has been configured.
+    OracleNotConfigured = 71,
+    /// Oracle timelock has not elapsed for the pending proposal.
+    OracleTimelockNotElapsed = 72,
+    /// No pending oracle proposal.
+    NoPendingOracle = 73,
     /// #371: `close_intent` was called on an intent that is not in a terminal
     /// state (Filled, Cancelled, Expired, Resolved, Slashed).
     IntentNotTerminal = 36,
@@ -1486,6 +1732,10 @@ impl IntentSettlement {
                 intent_expiry: DEFAULT_INTENT_EXPIRY,
                 protocol_fee_bps: DEFAULT_PROTOCOL_FEE_BPS,
                 max_active_intents_per_solver: DEFAULT_MAX_ACTIVE_INTENTS_PER_SOLVER,
+                max_slash_cycles: 3,
+                referral_share_bps: 0,
+                backstop_vault_share_bps: 0,
+                coverage_multiplier: 10,
             },
         );
         // Fresh deploys are already at the current schema — `migrate` is a
@@ -1771,12 +2021,18 @@ impl IntentSettlement {
             panic_with_error!(&env, Error::InvalidConfig);
         }
 
+        // Preserve fields not updated by this call.
+        let existing = Self::load_config(&env);
         let cfg = ProtocolConfig {
             min_bond,
             fill_window,
             intent_expiry,
             protocol_fee_bps,
             max_active_intents_per_solver,
+            max_slash_cycles: existing.max_slash_cycles,
+            referral_share_bps: existing.referral_share_bps,
+            backstop_vault_share_bps: existing.backstop_vault_share_bps,
+            coverage_multiplier: existing.coverage_multiplier,
         };
         env.storage().instance().set(&DataKey::Config, &cfg);
         Self::bump_instance_ttl(&env);
@@ -2779,6 +3035,7 @@ impl IntentSettlement {
             dst_token,
             min_dst_amount,
             deadline,
+            referrer,
         )
     }
 
@@ -2797,6 +3054,7 @@ impl IntentSettlement {
         dst_token: Address,
         min_dst_amount: i128,
         deadline: Option<u64>,
+        referrer: Option<Address>,
     ) -> BytesN<32> {
         Self::require_not_paused(&env);
         Self::bump_instance_ttl(&env);
@@ -2920,6 +3178,11 @@ impl IntentSettlement {
             dispute_deadline: None,
             dispute_raised_at: None,
             resolution: None,
+            solver_tier: 0,
+            // #281: referrer for fee-sharing (passed through from submit_intent)
+            referrer,
+            // #241: no slash cycles yet
+            slash_cycles: 0,
             // Issue #371: not terminal yet.
             terminal_at: None,
         };
@@ -3001,6 +3264,16 @@ impl IntentSettlement {
         intent_id: BytesN<32>,
         bond_token: Address,
     ) {
+        // Auth audit: require_auth() is correct. The solver must sign to
+        // voluntarily take on the fill obligation and bond risk.
+        solver.require_auth();
+        Self::accept_intent_inner_body(env, solver, intent_id, bond_token);
+    }
+
+    /// Body of `accept_intent` without the `solver.require_auth()` gate. Shared
+    /// with `batch_accept_intent`, which authorises the solver once per batch
+    /// (`require_auth()` is one-shot per address per invocation).
+    fn accept_intent_inner_body(env: Env, solver: Address, intent_id: BytesN<32>, bond_token: Address) {
         Self::require_not_paused(&env);
         Self::bump_instance_ttl(&env);
 
@@ -3074,6 +3347,35 @@ impl IntentSettlement {
         intent.deadline = now + Self::tier_fill_window(tier, ctx.config.fill_window);
 
         solver_record.active_intents += 1;
+
+        // ── Exposure tracking (#367) ─────────────────────────────────────────
+        // Use a flat 1.0× weight (10_000 bps) until the oracle (#368) supplies
+        // real prices. Same-token intents are always measured; cross-token
+        // intents use the same conservative default until the oracle is live.
+        let weight: i128 = 10_000; // 1.0× in bps
+        let notional = intent.min_dst_amount
+            .checked_mul(weight)
+            .unwrap_or(intent.min_dst_amount)
+            .checked_div(BPS_DENOMINATOR)
+            .unwrap_or(intent.min_dst_amount);
+        let current_exposure: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SolverExposure(solver.clone()))
+            .unwrap_or(0);
+        let new_exposure = current_exposure.saturating_add(notional);
+        // Coverage: new_exposure ≤ bond × coverage_multiplier
+        let bond_for_coverage = Self::get_solver_bond_amount(&env, &solver_record, &bond_token);
+        let capacity = bond_for_coverage
+            .checked_mul(cfg.coverage_multiplier)
+            .unwrap_or(i128::MAX);
+        if new_exposure > capacity {
+            panic_with_error!(&env, Error::ExposureExceeded);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::SolverExposure(solver.clone()), &new_exposure);
+
         env.storage()
             .persistent()
             .set(&DataKey::Solver(solver.clone()), &solver_record);
@@ -3152,6 +3454,12 @@ impl IntentSettlement {
         Self::fill_intent_inner(env, solver, intent_id, fill_amount);
     }
 
+    /// Body of `fill_intent` without the `solver.require_auth()` gate. Shared
+    /// with `batch_fill_intent`, which authorises the solver once per batch
+    /// (`require_auth()` is one-shot per address per invocation). The solver's
+    /// signature over the batch call still covers the individual dst-token
+    /// transfers each fill performs.
+    fn fill_intent_inner(env: Env, solver: Address, intent_id: BytesN<32>, fill_amount: i128, require_proof: bool) {
     /// Body of `fill_intent` without the `solver.require_auth()` gate.
     ///
     /// Issue #375: uses `InvocationCtx` to load `Config`, `FeeRecipient`,
@@ -3188,6 +3496,10 @@ impl IntentSettlement {
             Self::validate_proof(&env, &intent, &intent_id);
         }
 
+        // Compute protocol fee with explicit checked arithmetic (#269 / #31).
+        // Taking the fee from the solver keeps the user's received amount at or
+        // above `min_dst_amount`.
+        let fee_bps = Self::get_tiered_fee_bps(&env);
         // Issue #375: load Config, FeeRecipient, OpenIntents, TotalVolume once.
         let mut ctx = InvocationCtx::load(&env);
 
@@ -3203,6 +3515,10 @@ impl IntentSettlement {
             .unwrap_or_else(|| panic_with_error!(&env, Error::FeeOverflow));
 
         // ── Effects first (CEI) ──────────────────────────────────────────────
+        // Mark every state change and write it to storage *before* any external
+        // token transfer executes. A hostile SEP-41 token that tries to re-enter
+        // fill_intent or slash_solver during the transfer sees the already-
+        // updated intent state and is rejected by the guards above.
         // Every state change below is written to storage *before* the token
         // transfers at the end of this function. A hostile SEP-41 token that
         // tries to re-enter `fill_intent` / `slash_solver` during a transfer
@@ -3242,6 +3558,27 @@ impl IntentSettlement {
 
             ctx.increment_open_intents();
             Self::add_to_open_intent_list(&env, &intent_id);
+        }
+
+        // Release accepted_notional exposure (#367)
+        {
+            let exposure: i128 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::SolverExposure(solver.clone()))
+                .unwrap_or(0);
+            // Release: full notional on complete fill; proportional on partial.
+            let released = if cumulative >= intent.min_dst_amount {
+                intent.min_dst_amount
+            } else {
+                fill_amount
+            };
+            env.storage()
+                .persistent()
+                .set(
+                    &DataKey::SolverExposure(solver.clone()),
+                    &(exposure.saturating_sub(released)),
+                );
         }
 
         env.storage()
@@ -3732,6 +4069,20 @@ impl IntentSettlement {
         solver_record.active_intents = solver_record.active_intents.saturating_sub(1);
         Self::solver_intents_remove(&env, &solver_addr, &intent_id);
 
+        // Release accepted_notional exposure (#367)
+        let exposure: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SolverExposure(solver_addr.clone()))
+            .unwrap_or(0);
+        let unfilled_notional = intent.min_dst_amount.saturating_sub(intent.total_filled);
+        env.storage()
+            .persistent()
+            .set(
+                &DataKey::SolverExposure(solver_addr.clone()),
+                &(exposure.saturating_sub(unfilled_notional)),
+            );
+
         // Decrement TotalBonded by the slashed amount (issue #231)
         let total_bonded: i128 = env
             .storage()
@@ -3775,9 +4126,43 @@ impl IntentSettlement {
         Self::bump_solver_ttl(&env, &solver_addr);
         Self::save_intent(&env, &intent_id, &intent);
 
+        // Send slash to fee recipient, in the same token the solver bonded
+        // (issue #187), with state already committed above.
+        // Route a configured share to the backstop pool (#370).
         // Send the slashed amount to the fee recipient (same bond token, #187).
         if slash_amount > 0 {
             let client = token::Client::new(&env, &bond_token);
+
+            let vault_share_bps = cfg.backstop_vault_share_bps;
+            let vault_share = if vault_share_bps > 0 {
+                slash_amount
+                    .checked_mul(vault_share_bps)
+                    .unwrap_or(0)
+                    .checked_div(BPS_DENOMINATOR)
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            let fee_recipient_share = slash_amount - vault_share;
+
+            if fee_recipient_share > 0 {
+                client.transfer(
+                    &env.current_contract_address(),
+                    &fee_recipient,
+                    &fee_recipient_share,
+                );
+            }
+            if vault_share > 0 {
+                // Credit the backstop pool in instance storage (#369).
+                let pool: i128 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::BackstopPool)
+                    .unwrap_or(0);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::BackstopPool, &(pool + vault_share));
+            }
             client.transfer(
                 &env.current_contract_address(),
                 &ctx.fee_recipient,
@@ -4530,6 +4915,7 @@ impl IntentSettlement {
                 dst_token,
                 min_dst_amount,
                 deadline,
+                None, // batch submissions do not support referrers
             );
             result.push_back(intent_id);
         }
@@ -4549,7 +4935,9 @@ impl IntentSettlement {
         solver.require_auth();
         let bond_token = Self::load_bond_token(&env);
 
+        let bond_token = Self::load_bond_token(&env);
         for intent_id in intent_ids {
+            Self::accept_intent_inner_body(env.clone(), solver.clone(), intent_id, bond_token.clone());
             Self::accept_intent_inner(
                 env.clone(),
                 solver.clone(),
@@ -4584,7 +4972,7 @@ impl IntentSettlement {
         );
 
         for (intent_id, fill_amount) in fills {
-            Self::fill_intent_inner(env.clone(), solver.clone(), intent_id, fill_amount);
+            Self::fill_intent_inner(env.clone(), solver.clone(), intent_id, fill_amount, false);
         }
     }
 
@@ -5002,47 +5390,28 @@ impl IntentSettlement {
     pub fn claim_backstop_compensation(env: Env, intent_id: BytesN<32>) {
         Self::bump_instance_ttl(&env);
 
-        // ── Checks ────────────────────────────────────────────────────────────
-
-        // Load the intent. The user must have submitted it.
+        // ── Load intent ───────────────────────────────────────────────────────
         let intent: IntentRecord = env
             .storage()
             .persistent()
             .get(&DataKey::Intent(intent_id.clone()))
             .unwrap_or_else(|| panic_with_error!(&env, Error::IntentNotFound));
 
-        // Only the intent's original user may claim.
-        // require_auth enforces the signature requirement; the ownership check
-        // below confirms they're claiming their own intent.
         intent.user.require_auth();
 
-        // The intent must be in a state that indicates it was slashed at least
-        // once: after slash_solver the intent is re-opened as Open or
-        // PartiallyFilled.  A freshly-submitted intent that was never slashed
-        // would be Open too, but we require that a slash event actually happened.
-        // We detect this by checking that the intent has a non-zero
-        // fills_failed-equivalent: since IntentRecord doesn't carry a slash
-        // counter, we instead check that the intent's state is Open or
-        // PartiallyFilled AND the solver field is None AND the intent has been
-        // through at least one accept cycle.  The most reliable proxy here is
-        // that the intent's deadline has been reset by slash_solver (i.e. the
-        // intent is back open after being accepted), but that is indistinguishable
-        // from a freshly submitted intent.
-        //
-        // Design decision: rather than adding a slash-count field to IntentRecord
-        // (which would break existing storage layouts), we accept that any user
-        // with an Open/PartiallyFilled intent can call this.  The pool only
-        // contains funds if backstop_bps > 0 and at least one slash has happened,
-        // so an intent that was never slashed would face an empty pool and be
-        // rejected by the BackstopPoolEmpty guard below.  The double-claim guard
-        // (BackstopClaimed key) prevents a user from claiming twice on the same
-        // intent.
-        if intent.state != IntentState::Open && intent.state != IntentState::PartiallyFilled {
-            panic_with_error!(&env, Error::IntentNotAccepted); // re-use: "not in claimable state"
+        // ── Eligible state check (#369) ───────────────────────────────────────
+        // Eligible: Slashed (abandoned after max_slash_cycles) OR
+        // Open/PartiallyFilled that has been through at least one slash cycle.
+        let eligible = match intent.state {
+            IntentState::Slashed => true,
+            IntentState::Open | IntentState::PartiallyFilled => intent.slash_cycles > 0,
+            _ => false,
+        };
+        if !eligible {
+            panic_with_error!(&env, Error::IntentNotAccepted); // re-use: not in claimable state
         }
 
-        // Double-claim guard: each intent may only be claimed once, regardless of
-        // how many slash cycles it accumulates.
+        // ── Double-claim guard ────────────────────────────────────────────────
         if env
             .storage()
             .persistent()
@@ -5051,7 +5420,7 @@ impl IntentSettlement {
             panic_with_error!(&env, Error::BackstopAlreadyClaimed);
         }
 
-        // Pool must be non-empty.
+        // ── Pool must be non-empty ────────────────────────────────────────────
         let pool: i128 = env
             .storage()
             .instance()
@@ -5061,35 +5430,50 @@ impl IntentSettlement {
             panic_with_error!(&env, Error::BackstopPoolEmpty);
         }
 
-        // ── Compute payout ────────────────────────────────────────────────────
+        // ── Per-intent cap: MAX_BACKSTOP_INTENT_BPS of min_dst_amount (#369) ─
+        let intent_cap = intent.min_dst_amount
+            .checked_mul(MAX_BACKSTOP_INTENT_BPS)
+            .unwrap_or(intent.min_dst_amount)
+            .checked_div(BPS_DENOMINATOR)
+            .unwrap_or(1)
+            .max(1);
 
-        // Cap: MAX_BACKSTOP_CLAIM_BPS (1%) of the current pool balance.
-        // Floor: at least 1 stroop (so the payout is never zero when pool > 0).
-        let claim_cap = (pool
-            .checked_mul(MAX_BACKSTOP_CLAIM_BPS)
-            .unwrap_or(pool)
-            .checked_div(10_000)
-            .unwrap_or(1))
-        .max(1);
-        // Payout is the smaller of the cap and the full pool balance.
-        let payout = claim_cap.min(pool);
+        // ── Per-user epoch cap (#369) ─────────────────────────────────────────
+        let now = env.ledger().timestamp();
+        let epoch = now / BACKSTOP_EPOCH_SECS;
+        let epoch_key = DataKey::UserEpochClaim(intent.user.clone(), epoch);
+        let epoch_claimed: i128 = env
+            .storage()
+            .persistent()
+            .get(&epoch_key)
+            .unwrap_or(0);
+        let epoch_remaining = MAX_BACKSTOP_USER_EPOCH_CLAIM.saturating_sub(epoch_claimed);
+        if epoch_remaining <= 0 {
+            panic_with_error!(&env, Error::BackstopPoolEmpty); // epoch cap exhausted
+        }
+
+        // ── Pro-rata when pool is short: payout = min(intent_cap, epoch_remaining, pool)
+        let payout = intent_cap.min(epoch_remaining).min(pool).max(1);
 
         // ── Effects ───────────────────────────────────────────────────────────
-
-        // Mark this intent as claimed before transferring, preventing re-entrancy
-        // or a back-to-back call from double-paying.
         env.storage()
             .persistent()
             .set(&DataKey::BackstopClaimed(intent_id.clone()), &true);
-        Self::bump_intent_ttl(&env, &intent_id); // share TTL with the intent record
-
-        // Decrement the pool by the payout amount.
+        Self::bump_intent_ttl(&env, &intent_id);
         env.storage()
             .instance()
             .set(&DataKey::BackstopPool, &(pool - payout));
+        env.storage()
+            .persistent()
+            .set(&epoch_key, &(epoch_claimed + payout));
+        // Bump epoch key TTL alongside the intent.
+        env.storage().persistent().extend_ttl(
+            &epoch_key,
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND_TO,
+        );
 
         // ── Interaction ───────────────────────────────────────────────────────
-
         let bond_token = Self::load_bond_token(&env);
         let client = token::Client::new(&env, &bond_token);
         client.transfer(&env.current_contract_address(), &intent.user, &payout);
@@ -5289,6 +5673,71 @@ impl IntentSettlement {
         env.storage().persistent().get(&DataKey::Solver(solver))
     }
 
+    /// #367: Returns (used_notional, capacity_notional) for a solver.
+    /// `capacity = bond * coverage_multiplier` from ProtocolConfig.
+    /// `used` is the sum of accepted intent notionals not yet released.
+    pub fn get_solver_exposure(env: Env, solver: Address) -> (i128, i128) {
+        let used: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SolverExposure(solver.clone()))
+            .unwrap_or(0);
+        let capacity = match env
+            .storage()
+            .persistent()
+            .get::<_, SolverRecord>(&DataKey::Solver(solver))
+        {
+            Some(rec) => {
+                let cfg = Self::load_config(&env);
+                rec.bond_amount
+                    .checked_mul(cfg.coverage_multiplier)
+                    .unwrap_or(i128::MAX)
+            }
+            None => 0,
+        };
+        (used, capacity)
+    }
+
+    /// #368: Admin-only — propose a new oracle adapter (timelocked 48 h).
+    pub fn propose_oracle(env: Env, oracle: Address) {
+        Self::require_admin(&env);
+        let eta = env.ledger().timestamp() + ADMIN_TIMELOCK_DELAY;
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingOracle, &(oracle.clone(), eta));
+        env.events()
+            .publish((Symbol::new(&env, "oracle_proposed"),), (oracle, eta));
+    }
+
+    /// #368: Execute a pending oracle proposal after the timelock has elapsed.
+    pub fn execute_oracle(env: Env) {
+        let (pending, eta): (Address, u64) = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingOracle)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoPendingOracle));
+        if env.ledger().timestamp() < eta {
+            panic_with_error!(&env, Error::OracleTimelockNotElapsed);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::OracleAddr, &pending.clone());
+        env.storage().instance().remove(&DataKey::PendingOracle);
+        env.events()
+            .publish((Symbol::new(&env, "oracle_set"),), pending);
+    }
+
+    /// #368: Returns the current oracle address, if set.
+    pub fn get_oracle(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::OracleAddr)
+    }
+
+    /// List the intent IDs currently `Accepted` by `solver` (issue #245).
+    /// Returns an empty `Vec` if the solver has no in-flight obligations (or
+    /// has never accepted an intent). Lets a solver bot recovering from a
+    /// crash rediscover its own active intents without replaying events.
+    pub fn get_solver_intents(env: Env, solver: Address) -> Vec<BytesN<32>> {
+        env.storage()
     /// List the intent IDs currently `Accepted` by `solver`, paginated
     /// (issue #245, #374).
     ///
@@ -6321,6 +6770,10 @@ impl IntentSettlement {
                 intent_expiry: DEFAULT_INTENT_EXPIRY,
                 protocol_fee_bps: DEFAULT_PROTOCOL_FEE_BPS,
                 max_active_intents_per_solver: DEFAULT_MAX_ACTIVE_INTENTS_PER_SOLVER,
+                max_slash_cycles: 3,
+                referral_share_bps: 0,
+                backstop_vault_share_bps: 0,
+                coverage_multiplier: 10,
             })
     }
 
